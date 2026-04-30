@@ -1,420 +1,428 @@
-async function stepBuildContract(inputs) {
-  core.startGroup('Step 1 — Build / locate contract WASM');
+async function buildContractWasm(contractDir) {
+  core.startGroup('📦 Building NEAR contract WASM');
 
-  const { contractPath } = inputs;
-  const resolvedPath = path.resolve(contractPath);
-
-  if (!fileExists(resolvedPath)) {
-    throw new Error(`contract_path does not exist: ${resolvedPath}`);
+  const absoluteDir = path.resolve(contractDir);
+  if (!fs.existsSync(absoluteDir)) {
+    throw new Error(`contract_path '${absoluteDir}' does not exist.`);
+  }
+  const cargoToml = path.join(absoluteDir, 'Cargo.toml');
+  if (!fs.existsSync(cargoToml)) {
+    throw new Error(`No Cargo.toml found in '${absoluteDir}'.`);
   }
 
-  const stat = fs.statSync(resolvedPath);
+  // Parse the package name so we know what the wasm file will be called.
+  const cargoContent = fs.readFileSync(cargoToml, 'utf8');
+  const nameMatch = cargoContent.match(/^\s*name\s*=\s*"([^"]+)"/m);
+  if (!nameMatch) {
+    throw new Error(`Cannot determine package name from ${cargoToml}`);
+  }
+  const packageName = nameMatch[1].replace(/-/g, '_');
 
-  // Case A: caller pointed directly at a .wasm file
-  if (stat.isFile()) {
-    if (!resolvedPath.endsWith('.wasm')) {
-      throw new Error(`contract_path points to a file but it is not a .wasm: ${resolvedPath}`);
+  let buildStdout = '';
+  let buildStderr = '';
+
+  const buildOptions = {
+    cwd: absoluteDir,
+    listeners: {
+      stdout: (data) => { buildStdout += data.toString(); },
+      stderr: (data) => { buildStderr += data.toString(); },
+    },
+  };
+
+  // Install wasm32 target if not already present (idempotent).
+  core.info('Ensuring wasm32-unknown-unknown target is installed …');
+  await exec.exec('rustup', ['target', 'add', 'wasm32-unknown-unknown'], buildOptions);
+
+  core.info(`Building ${packageName} …`);
+  const exitCode = await exec.exec(
+    'cargo',
+    ['build', '--target', 'wasm32-unknown-unknown', '--release'],
+    { ...buildOptions, ignoreReturnCode: true },
+  );
+
+  if (exitCode !== 0) {
+    core.error('cargo build stderr:\n' + buildStderr);
+    throw new Error(`cargo build failed with exit code ${exitCode}`);
+  }
+
+  // Canonical output path produced by cargo.
+  const wasmPath = path.join(
+    absoluteDir,
+    'target',
+    'wasm32-unknown-unknown',
+    'release',
+    `${packageName}.wasm`,
+  );
+
+  if (!fs.existsSync(wasmPath)) {
+    // Fallback: search for any .wasm file under target/wasm32-unknown-unknown/release/
+    const releaseDir = path.join(absoluteDir, 'target', 'wasm32-unknown-unknown', 'release');
+    if (!fs.existsSync(releaseDir)) {
+      throw new Error(`Expected release directory not found: ${releaseDir}`);
     }
-    core.info(`Using pre-built WASM: ${resolvedPath}`);
+    const wasmFiles = fs.readdirSync(releaseDir).filter(f => f.endsWith('.wasm') && !f.endsWith('.d'));
+    if (wasmFiles.length === 0) {
+      throw new Error(`No .wasm file found in ${releaseDir} after successful build.`);
+    }
+    core.warning(`Expected ${packageName}.wasm but found: ${wasmFiles.join(', ')}. Using first match.`);
+    const foundPath = path.join(releaseDir, wasmFiles[0]);
+    core.info(`✅ WASM built successfully: ${foundPath}`);
     core.endGroup();
-    return resolvedPath;
+    return { wasmPath: foundPath, buildOutput: buildStdout + buildStderr };
   }
 
-  // Case B: caller pointed at a directory — try to build
-  if (!stat.isDirectory()) {
-    throw new Error(`contract_path is neither a file nor a directory: ${resolvedPath}`);
-  }
-
-  core.info(`Building NEAR contract in: ${resolvedPath}`);
-
-  // Determine build tool
-  const hasCargoToml = fileExists(path.join(resolvedPath, 'Cargo.toml'));
-  const hasPackageJson = fileExists(path.join(resolvedPath, 'package.json'));
-
-  let wasmPath = null;
-
-  if (hasCargoToml) {
-    core.info('Detected Rust/Cargo project.');
-
-    // Ensure wasm32 target is available
-    try {
-      execCommand('rustup target add wasm32-unknown-unknown', resolvedPath, 'rustup');
-    } catch (e) {
-      core.warning(`rustup target add failed (may already be installed): ${e.message}`);
-    }
-
-    // Try cargo-near first, then fall back to plain cargo build
-    const cargoNearAvailable = spawnSync('cargo near --version', { shell: true }).status === 0;
-
-    if (cargoNearAvailable) {
-      core.info('Using cargo-near to build optimised WASM.');
-      execCommand('cargo near build --release', resolvedPath, 'cargo-near');
-    } else {
-      core.info('cargo-near not found — using cargo build --target wasm32-unknown-unknown.');
-      execCommand(
-        'cargo build --target wasm32-unknown-unknown --release',
-        resolvedPath,
-        'cargo-build',
-      );
-    }
-
-    // Locate the produced wasm file
-    const candidates = findWasmFiles(path.join(resolvedPath, 'target'));
-    // Prefer release builds and the closest match to the project name
-    const releaseWasms = candidates.filter(
-      (f) => f.includes('/release/') && !f.includes('/deps/'),
-    );
-    if (releaseWasms.length === 0) {
-      throw new Error(
-        `Build succeeded but no .wasm found under ${path.join(resolvedPath, 'target')}. ` +
-          `All WASM found: ${candidates.join(', ') || 'none'}`,
-      );
-    }
-
-    // Pick largest (most likely the main contract, not a dep stub)
-    releaseWasms.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
-    wasmPath = releaseWasms[0];
-    core.info(`Found release WASM: ${wasmPath}`);
-  } else if (hasPackageJson) {
-    core.info('Detected Node.js project (AssemblyScript / near-sdk-js).');
-
-    // Install dependencies
-    execCommand('npm ci --prefer-offline || npm install', resolvedPath, 'npm-install');
-
-    // Try standard build scripts
-    const pkg = JSON.parse(fs.readFileSync(path.join(resolvedPath, 'package.json'), 'utf8'));
-    const scripts = pkg.scripts || {};
-
-    if (scripts.build) {
-      execCommand('npm run build', resolvedPath, 'npm-build');
-    } else if (scripts['build:release']) {
-      execCommand('npm run build:release', resolvedPath, 'npm-build-release');
-    } else {
-      throw new Error(
-        'No "build" or "build:release" script found in package.json. ' +
-          'Cannot build the contract automatically.',
-      );
-    }
-
-    // Locate wasm
-    const candidates = findWasmFiles(resolvedPath);
-    if (candidates.length === 0) {
-      throw new Error(
-        `Build succeeded but no .wasm file found under ${resolvedPath}.`,
-      );
-    }
-    // Prefer build/ or out/ directories
-    const preferred = candidates.filter(
-      (f) => f.includes('/build/') || f.includes('/out/') || f.includes('/res/'),
-    );
-    const sorted = (preferred.length > 0 ? preferred : candidates).sort(
-      (a, b) => fs.statSync(b).size - fs.statSync(a).size,
-    );
-    wasmPath = sorted[0];
-    core.info(`Found WASM: ${wasmPath}`);
-  } else {
-    // Last resort: scan for any existing wasm
-    core.warning(
-      'No Cargo.toml or package.json found — scanning for pre-built WASM files.',
-    );
-    const candidates = findWasmFiles(resolvedPath);
-    if (candidates.length === 0) {
-      throw new Error(
-        `No recognisable build system found and no .wasm files present in ${resolvedPath}.`,
-      );
-    }
-    candidates.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
-    wasmPath = candidates[0];
-    core.info(`Using largest existing WASM: ${wasmPath}`);
-  }
-
+  core.info(`✅ WASM built successfully: ${wasmPath}`);
   core.endGroup();
-  return wasmPath;
+  return { wasmPath, buildOutput: buildStdout + buildStderr };
 }
 
-// ─── Step 2 – Check size against limits ──────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 2 — Check size against limits
+// ─────────────────────────────────────────────────────────────────────────────
 
-function stepCheckSize(wasmPath, inputs) {
-  core.startGroup('Step 2 — Check WASM size against limits');
+/**
+ * Reads the WASM file size and evaluates it against the configured limit and
+ * warning threshold.
+ *
+ * Returns an object:
+ * {
+ *   sizeBytes: number,
+ *   sizeLimitBytes: number,
+ *   warningThresholdBytes: number,
+ *   sizePercentage: number,      // e.g. 72.3
+ *   isOverLimit: boolean,
+ *   isWarning: boolean,
+ *   status: 'ok' | 'warning' | 'over_limit',
+ * }
+ */
+function checkSizeAgainstLimits(wasmPath, sizeLimitBytes, warningThresholdPercent) {
+  core.startGroup('📏 Checking WASM size against NEAR limits');
 
-  const { sizeLimitBytes, warningThresholdPercent } = inputs;
   const stats = fs.statSync(wasmPath);
-  const contractSizeBytes = stats.size;
+  const sizeBytes = stats.size;
+  const warningThresholdBytes = Math.floor((warningThresholdPercent / 100) * sizeLimitBytes);
+  const sizePercentage = (sizeBytes / sizeLimitBytes) * 100;
 
-  const warningThresholdBytes = Math.round((warningThresholdPercent / 100) * sizeLimitBytes);
-  const percentOfLimit = (contractSizeBytes / sizeLimitBytes) * 100;
+  const sizeKb = (sizeBytes / 1024).toFixed(2);
+  const limitKb = (sizeLimitBytes / 1024).toFixed(2);
+  const warningKb = (warningThresholdBytes / 1024).toFixed(2);
 
-  core.info(`WASM file        : ${wasmPath}`);
-  core.info(`Contract size    : ${formatBytes(contractSizeBytes)} (${contractSizeBytes} bytes)`);
-  core.info(`Size limit       : ${formatBytes(sizeLimitBytes)} (${sizeLimitBytes} bytes)`);
-  core.info(`Warning threshold: ${warningThresholdPercent}% → ${formatBytes(warningThresholdBytes)}`);
-  core.info(`Usage            : ${formatPercent(contractSizeBytes, sizeLimitBytes)}% of limit`);
+  core.info(`Contract size : ${sizeBytes.toLocaleString()} bytes (${sizeKb} KB)`);
+  core.info(`NEAR limit    : ${sizeLimitBytes.toLocaleString()} bytes (${limitKb} KB)`);
+  core.info(`Warning at    : ${warningThresholdBytes.toLocaleString()} bytes (${warningKb} KB) — ${warningThresholdPercent}%`);
+  core.info(`Usage         : ${sizePercentage.toFixed(2)}%`);
 
-  const isOverLimit = contractSizeBytes > sizeLimitBytes;
-  const isNearLimit = contractSizeBytes >= warningThresholdBytes && !isOverLimit;
+  const isOverLimit = sizeBytes > sizeLimitBytes;
+  const isWarning   = !isOverLimit && sizeBytes >= warningThresholdBytes;
+  const status      = isOverLimit ? 'over_limit' : isWarning ? 'warning' : 'ok';
 
   if (isOverLimit) {
+    const excess = sizeBytes - sizeLimitBytes;
     core.error(
-      `❌ Contract size ${formatBytes(contractSizeBytes)} exceeds limit of ${formatBytes(sizeLimitBytes)} ` +
-        `(${formatPercent(contractSizeBytes, sizeLimitBytes)}% — over by ${formatBytes(contractSizeBytes - sizeLimitBytes)})`,
+      `❌ Contract size exceeds NEAR limit by ${excess.toLocaleString()} bytes ` +
+      `(${(excess / 1024).toFixed(2)} KB).`,
     );
-  } else if (isNearLimit) {
+  } else if (isWarning) {
     core.warning(
-      `⚠️  Contract size ${formatBytes(contractSizeBytes)} is ${formatPercent(contractSizeBytes, sizeLimitBytes)}% of the ` +
-        `${formatBytes(sizeLimitBytes)} limit (threshold: ${warningThresholdPercent}%).`,
+      `⚠️  Contract size is ${sizePercentage.toFixed(1)}% of the NEAR limit. ` +
+      `Consider optimizing before approaching the ${sizeLimitBytes.toLocaleString()}-byte ceiling.`,
     );
   } else {
-    core.info(
-      `✅ Contract size ${formatBytes(contractSizeBytes)} is within limits ` +
-        `(${formatPercent(contractSizeBytes, sizeLimitBytes)}% of ${formatBytes(sizeLimitBytes)}).`,
-    );
+    core.info(`✅ Contract size is within safe limits (${sizePercentage.toFixed(1)}% used).`);
   }
 
   core.endGroup();
-  return { contractSizeBytes, sizeLimitBytes, warningThresholdBytes, percentOfLimit, isOverLimit, isNearLimit };
+  return {
+    sizeBytes,
+    sizeLimitBytes,
+    warningThresholdBytes,
+    sizePercentage,
+    isOverLimit,
+    isWarning,
+    status,
+  };
 }
 
-// ─── Step 3 – Compare with previous / baseline build ─────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 3 — Compare with previous builds (baseline branch)
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function stepCompareBaseline(currentSizeBytes, inputs) {
-  core.startGroup('Step 3 — Compare with previous build');
+/**
+ * Attempts to get the WASM size from the baseline branch by:
+ *   1. Stashing current changes (non-destructive).
+ *   2. Fetching + checking out the baseline branch.
+ *   3. Building it in a temp directory.
+ *   4. Returning to the original branch / restoring work-tree.
+ *
+ * If anything fails (branch doesn't exist, build fails, etc.) we log a warning
+ * and return null so the pipeline continues.
+ *
+ * Returns { baselineSizeBytes: number, deltaBytes: number } or null.
+ */
+async function compareWithBaseline(contractDir, currentSizeBytes, compareBranch) {
+  core.startGroup(`🔀 Comparing with baseline branch '${compareBranch}'`);
 
-  const { baselineArtifact } = inputs;
+  // We work in a temp clone to avoid disturbing the working tree.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'near-size-baseline-'));
+  core.info(`Using temp directory: ${tmpDir}`);
+
   let baselineSizeBytes = null;
-  let delta = null;
-  let source = 'none';
 
-  // Sub-step 3a: Try reading a local baseline file
-  if (baselineArtifact && fileExists(baselineArtifact)) {
-    try {
-      const raw = fs.readFileSync(baselineArtifact, 'utf8').trim();
-      // Support plain number OR JSON {"size": N}
-      let parsed;
-      try {
-        parsed = JSON.parse(raw);
-        if (typeof parsed === 'object' && parsed !== null && typeof parsed.size === 'number') {
-          baselineSizeBytes = parsed.size;
-        } else if (typeof parsed === 'number') {
-          baselineSizeBytes = parsed;
-        }
-      } catch {
-        const n = parseInt(raw, 10);
-        if (!isNaN(n)) baselineSizeBytes = n;
-      }
-      if (baselineSizeBytes !== null) {
-        source = `local file: ${baselineArtifact}`;
-        core.info(`Loaded baseline size from ${baselineArtifact}: ${formatBytes(baselineSizeBytes)}`);
-      }
-    } catch (e) {
-      core.warning(`Could not read baseline file ${baselineArtifact}: ${e.message}`);
-    }
-  }
-
-  // Sub-step 3b: Try GitHub Actions artifact API if we have a token and name
-  if (baselineSizeBytes === null && baselineArtifact && !fileExists(baselineArtifact)) {
-    core.info(`Attempting to fetch artifact "${baselineArtifact}" from GitHub Actions API…`);
-    try {
-      const fetched = await tryFetchArtifactSize(baselineArtifact);
-      if (fetched !== null) {
-        baselineSizeBytes = fetched;
-        source = `GitHub artifact: ${baselineArtifact}`;
-        core.info(`Fetched baseline size from artifact "${baselineArtifact}": ${formatBytes(baselineSizeBytes)}`);
-      }
-    } catch (e) {
-      core.warning(`Artifact fetch failed: ${e.message}`);
-    }
-  }
-
-  // Sub-step 3c: Try reading a conventionally named size file in the workspace
-  if (baselineSizeBytes === null) {
-    const conventionalPath = path.resolve('.near-size-baseline.json');
-    if (fileExists(conventionalPath)) {
-      try {
-        const raw = JSON.parse(fs.readFileSync(conventionalPath, 'utf8'));
-        if (typeof raw.size === 'number') {
-          baselineSizeBytes = raw.size;
-          source = `conventional file: ${conventionalPath}`;
-          core.info(`Loaded baseline from ${conventionalPath}: ${formatBytes(baselineSizeBytes)}`);
-        }
-      } catch (e) {
-        core.warning(`Could not parse ${conventionalPath}: ${e.message}`);
-      }
-    }
-  }
-
-  if (baselineSizeBytes !== null) {
-    delta = currentSizeBytes - baselineSizeBytes;
-    const deltaSign = delta >= 0 ? '+' : '';
-    const percentChange = ((delta / baselineSizeBytes) * 100).toFixed(2);
-    core.info(`Baseline source  : ${source}`);
-    core.info(`Baseline size    : ${formatBytes(baselineSizeBytes)}`);
-    core.info(`Current size     : ${formatBytes(currentSizeBytes)}`);
-    core.info(`Delta            : ${deltaSign}${formatBytes(Math.abs(delta))} (${deltaSign}${percentChange}%)`);
-
-    if (delta > 0) {
-      core.warning(`📈 Contract grew by ${formatBytes(delta)} (${deltaSign}${percentChange}%) since baseline.`);
-    } else if (delta < 0) {
-      core.info(`📉 Contract shrank by ${formatBytes(Math.abs(delta))} (${percentChange}%) since baseline.`);
-    } else {
-      core.info('➡️  Contract size is unchanged since baseline.');
-    }
-  } else {
-    core.info('No baseline available — skipping comparison.');
-  }
-
-  // Always write a new baseline file so subsequent runs can compare
-  const newBaseline = { size: currentSizeBytes, timestamp: new Date().toISOString() };
   try {
-    fs.writeFileSync('.near-size-baseline.json', JSON.stringify(newBaseline, null, 2));
-    core.info('Wrote .near-size-baseline.json for future comparisons.');
-  } catch (e) {
-    core.warning(`Could not write .near-size-baseline.json: ${e.message}`);
+    // Get the remote URL so we can do a shallow clone.
+    let remoteUrl = '';
+    await exec.exec('git', ['remote', 'get-url', 'origin'], {
+      listeners: { stdout: (d) => { remoteUrl += d.toString(); } },
+      ignoreReturnCode: true,
+    });
+    remoteUrl = remoteUrl.trim();
+
+    if (!remoteUrl) {
+      core.warning('Could not determine git remote URL — skipping baseline comparison.');
+      core.endGroup();
+      return null;
+    }
+
+    // Shallow clone of only the baseline branch.
+    core.info(`Cloning branch '${compareBranch}' …`);
+    const cloneCode = await exec.exec(
+      'git',
+      ['clone', '--depth', '1', '--branch', compareBranch, remoteUrl, tmpDir],
+      { ignoreReturnCode: true },
+    );
+
+    if (cloneCode !== 0) {
+      core.warning(`Branch '${compareBranch}' could not be cloned — skipping baseline comparison.`);
+      core.endGroup();
+      return null;
+    }
+
+    // Determine the relative path from the repo root to contract_path.
+    let repoRoot = '';
+    await exec.exec('git', ['rev-parse', '--show-toplevel'], {
+      listeners: { stdout: (d) => { repoRoot += d.toString(); } },
+    });
+    repoRoot = repoRoot.trim();
+
+    const relativeContractPath = path.relative(repoRoot, path.resolve(contractDir));
+    const baselineContractDir  = path.join(tmpDir, relativeContractPath);
+
+    if (!fs.existsSync(baselineContractDir)) {
+      core.warning(
+        `Contract path '${relativeContractPath}' does not exist on branch '${compareBranch}'. ` +
+        'Skipping baseline comparison.',
+      );
+      core.endGroup();
+      return null;
+    }
+
+    // Build the baseline.
+    core.info(`Building baseline contract in ${baselineContractDir} …`);
+    const { wasmPath: baselineWasmPath } = await buildContractWasm(baselineContractDir);
+    const baselineStats = fs.statSync(baselineWasmPath);
+    baselineSizeBytes = baselineStats.size;
+
+  } catch (err) {
+    core.warning(`Baseline comparison failed: ${err.message} — continuing without delta.`);
+    core.endGroup();
+    return null;
+  } finally {
+    // Always clean up the temp clone.
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+  }
+
+  const deltaBytes = currentSizeBytes - baselineSizeBytes;
+  const deltaKb    = (Math.abs(deltaBytes) / 1024).toFixed(2);
+  const sign       = deltaBytes > 0 ? '+' : deltaBytes < 0 ? '-' : '±';
+
+  core.info(`Baseline size : ${baselineSizeBytes.toLocaleString()} bytes`);
+  core.info(`Current size  : ${currentSizeBytes.toLocaleString()} bytes`);
+  core.info(`Delta         : ${sign}${Math.abs(deltaBytes).toLocaleString()} bytes (${sign}${deltaKb} KB)`);
+
+  if (deltaBytes > 0) {
+    core.warning(`⚠️  Contract grew by ${Math.abs(deltaBytes).toLocaleString()} bytes vs '${compareBranch}'.`);
+  } else if (deltaBytes < 0) {
+    core.info(`✅ Contract shrank by ${Math.abs(deltaBytes).toLocaleString()} bytes vs '${compareBranch}'.`);
+  } else {
+    core.info(`✅ No size change vs '${compareBranch}'.`);
   }
 
   core.endGroup();
-  return { baselineSizeBytes, delta };
+  return { baselineSizeBytes, deltaBytes };
 }
 
-// ─── Step 3 helper: fetch artifact size via GitHub REST API ──────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 4 — Suggest optimizations
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function tryFetchArtifactSize(artifactName) {
-  const token = process.env.GITHUB_TOKEN || process.env.INPUT_GITHUB_TOKEN || '';
-  const repo = process.env.GITHUB_REPOSITORY || '';
+/**
+ * Analyses the WASM binary to produce concrete, actionable optimization
+ * suggestions based on the contract's actual size and percentage usage.
+ *
+ * Returns a formatted string report.
+ */
+async function suggestOptimizations(wasmPath, sizeBytes, sizeLimitBytes, sizePercentage, contractDir) {
+  core.startGroup('💡 Generating optimization suggestions');
 
-  if (!token) {
-    core.info('GITHUB_TOKEN not set — cannot query artifacts API.');
-    return null;
-  }
-  if (!repo) {
-    core.info('GITHUB_REPOSITORY not set — cannot query artifacts API.');
-    return null;
-  }
-
-  const [owner, repoName] = repo.split('/');
-  if (!owner || !repoName) {
-    core.info(`Unexpected GITHUB_REPOSITORY format: "${repo}"`);
-    return null;
-  }
-
-  // List artifacts and find the one matching our name
-  const artifacts = await githubApiGet(
-    `/repos/${owner}/${repoName}/actions/artifacts?per_page=100`,
-    token,
-  );
-
-  if (!artifacts || !Array.isArray(artifacts.artifacts)) {
-    core.info('Artifacts API returned unexpected shape.');
-    return null;
-  }
-
-  // Find the most recent artifact with the matching name
-  const matching = artifacts.artifacts
-    .filter((a) => a.name === artifactName && !a.expired)
-    .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-  if (matching.length === 0) {
-    core.info(
-      `Found ${artifacts.artifacts.length} artifacts but none named "${artifactName}" (non-expired).`,
-    );
-    return null;
-  }
-
-  const artifact = matching[0];
-  core.info(
-    `Found artifact "${artifact.name}" (id=${artifact.id}, size_in_bytes=${artifact.size_in_bytes}, ` +
-      `created_at=${artifact.created_at})`,
-  );
-
-  // The artifact size_in_bytes is the compressed archive size; we want the WASM size.
-  // We store it in a metadata JSON in the archive. If unavailable, return the archive size
-  // with a warning so callers can decide whether it's useful.
-  if (typeof artifact.size_in_bytes === 'number' && artifact.size_in_bytes > 0) {
-    core.info(
-      `Using artifact archive size as proxy baseline: ${formatBytes(artifact.size_in_bytes)} ` +
-        `(note: this is the compressed archive — delta may not be exact).`,
-    );
-    return artifact.size_in_bytes;
-  }
-
-  return null;
-}
-
-// ─── Minimal GitHub REST GET helper (no Octokit dependency) ──────────────────
-
-function githubApiGet(apiPath, token) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: 'api.github.com',
-      path: apiPath,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'near-contract-size-check-action/1.0',
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28',
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          try {
-            resolve(JSON.parse(data));
-          } catch (e) {
-            reject(new Error(`Failed to parse GitHub API response: ${e.message}`));
-          }
-        } else {
-          reject(new Error(`GitHub API returned HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(15000, () => {
-      req.destroy(new Error('GitHub API request timed out after 15 s'));
-    });
-    req.end();
-  });
-}
-
-// ─── Step 4 – Suggest optimisations ──────────────────────────────────────────
-
-function stepSuggestOptimisations(wasmPath, sizeInfo, inputs) {
-  core.startGroup('Step 4 — Optimisation suggestions');
-
-  if (!inputs.optimizationSuggestions) {
-    core.info('optimization_suggestions is disabled — skipping.');
-    core.endGroup();
-    return [];
-  }
-
-  const { contractSizeBytes, sizeLimitBytes, percentOfLimit, isOverLimit, isNearLimit } = sizeInfo;
   const suggestions = [];
 
-  // Only emit suggestions when warranted
-  if (!isOverLimit && !isNearLimit) {
-    core.info('Contract is well within limits — no optimisation suggestions needed.');
-    core.endGroup();
-    return suggestions;
+  // ── 1. wasm-opt ────────────────────────────────────────────────────────────
+  suggestions.push({
+    priority: 'HIGH',
+    title: 'Run wasm-opt (Binaryen)',
+    description:
+      'wasm-opt -Oz often reduces WASM size by 10–30%.\n' +
+      '  cargo install wasm-opt\n' +
+      `  wasm-opt -Oz ${wasmPath} -o ${wasmPath}`,
+  });
+
+  // ── 2. Cargo.toml profile settings ─────────────────────────────────────────
+  const cargoToml = path.join(path.resolve(contractDir), 'Cargo.toml');
+  const cargoContent = fs.existsSync(cargoToml) ? fs.readFileSync(cargoToml, 'utf8') : '';
+  const hasLtoFat    = /lto\s*=\s*true|lto\s*=\s*"fat"/i.test(cargoContent);
+  const hasOpt3      = /opt-level\s*=\s*3/.test(cargoContent);
+  const hasPanic     = /panic\s*=\s*"abort"/.test(cargoContent);
+
+  if (!hasLtoFat) {
+    suggestions.push({
+      priority: 'HIGH',
+      title: 'Enable Link-Time Optimisation (LTO)',
+      description:
+        'Add to Cargo.toml under [profile.release]:\n' +
+        '  lto = true\n' +
+        'LTO allows the linker to dead-strip unused code across crates.',
+    });
+  }
+  if (!hasOpt3) {
+    suggestions.push({
+      priority: 'MEDIUM',
+      title: 'Set opt-level = "z" (size-optimised)',
+      description:
+        'Add to Cargo.toml under [profile.release]:\n' +
+        '  opt-level = "z"\n' +
+        '"z" aggressively optimises for size; "s" is a lighter alternative.',
+    });
+  }
+  if (!hasPanic) {
+    suggestions.push({
+      priority: 'MEDIUM',
+      title: 'Set panic = "abort"',
+      description:
+        'Add to Cargo.toml under [profile.release]:\n' +
+        '  panic = "abort"\n' +
+        'Removes the panic unwinding machinery, saving several KB.',
+    });
   }
 
-  core.info(`Analysing WASM for optimisation opportunities…`);
+  // ── 3. codegen-units ───────────────────────────────────────────────────────
+  if (!/codegen-units\s*=\s*1/.test(cargoContent)) {
+    suggestions.push({
+      priority: 'MEDIUM',
+      title: 'Set codegen-units = 1',
+      description:
+        'Add to Cargo.toml under [profile.release]:\n' +
+        '  codegen-units = 1\n' +
+        'A single codegen unit enables better inlining and dead-code removal.',
+    });
+  }
 
-  // ── Wasm-opt check ──────────────────────────────────────────────────────────
-  const wasmOptAvailable = spawnSync('wasm-opt --version', { shell: true }).status === 0;
-  if (wasmOptAvailable) {
-    // Measure what wasm-opt would produce
-    const tmpOut = wasmPath + '.opt-check.wasm';
-    try {
-      const result = spawnSync(
-        `wasm-opt -Oz --strip-debug --strip-producers "${wasmPath}" -o "${tmpOut}"`,
-        { shell: true, encoding: 'utf8' },
-      );
-      if (result.status === 0 && fileExists(tmpOut)) {
-        const optSize = fs.statSync(tmpOut).size;
-        const saving = contractSizeBytes - optSize;
-        if (saving > 0) {
-          suggestions.push({
-            id: 'wasm-opt',
+  // ── 4. Dependency audit ─────────────────────────────────────────────────────
+  suggestions.push({
+    priority: 'MEDIUM',
+    title: 'Audit dependencies for size',
+    description:
+      'Run: cargo bloat --release --target wasm32-unknown-unknown -n 20\n' +
+      'Identify the largest contributors and replace or feature-gate them.\n' +
+      'Common culprits: serde_json (use near-sdk built-ins), regex, chrono.',
+  });
+
+  // ── 5. near-sdk features ────────────────────────────────────────────────────
+  suggestions.push({
+    priority: 'MEDIUM',
+    title: 'Disable unused near-sdk features',
+    description:
+      'Example: near-sdk = { version = "5", default-features = false, features = ["legacy"] }\n' +
+      'Only enable the feature flags your contract actually uses.',
+  });
+
+  // ── 6. twiggy / wasm-snip for dead code ─────────────────────────────────
+  suggestions.push({
+    priority: 'LOW',
+    title: 'Remove dead code with wasm-snip',
+    description:
+      'cargo install wasm-snip\n' +
+      `wasm-snip --snip-rust-panicking-code ${wasmPath} -o ${wasmPath}\n` +
+      'Replaces unreachable functions with a single `unreachable` instruction.',
+  });
+
+  // ── 7. Strip debug sections ─────────────────────────────────────────────
+  suggestions.push({
+    priority: 'LOW',
+    title: 'Strip debug sections',
+    description:
+      'Add to Cargo.toml under [profile.release]:\n' +
+      '  debug = false\n' +
+      '  strip = "debuginfo"\n' +
+      'Removes DWARF debug information from the binary.',
+  });
+
+  // ── 8. Contract architecture ─────────────────────────────────────────────
+  if (sizePercentage > 60) {
+    suggestions.push({
+      priority: 'HIGH',
+      title: 'Consider splitting into multiple contracts',
+      description:
+        `At ${sizePercentage.toFixed(1)}% of the NEAR limit, consider a factory/component pattern.\n` +
+        'Split business logic across multiple smaller contracts that call each other via cross-contract calls.',
+    });
+  }
+
+  // ── Format report ───────────────────────────────────────────────────────────
+  const priorityOrder = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+  suggestions.sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]);
+
+  const lines = [
+    '═══════════════════════════════════════════════════════════',
+    '  NEAR CONTRACT SIZE OPTIMIZATION REPORT',
+    '═══════════════════════════════════════════════════════════',
+    `  Current size  : ${sizeBytes.toLocaleString()} bytes (${(sizeBytes / 1024).toFixed(2)} KB)`,
+    `  NEAR limit    : ${sizeLimitBytes.toLocaleString()} bytes (${(sizeLimitBytes / 1024).toFixed(2)} KB)`,
+    `  Usage         : ${sizePercentage.toFixed(2)}%`,
+    '',
+    `  ${suggestions.length} optimization suggestion(s):`,
+    '───────────────────────────────────────────────────────────',
+  ];
+
+  suggestions.forEach((s, i) => {
+    lines.push(`  [${String(i + 1).padStart(2)}] [${s.priority.padEnd(6)}] ${s.title}`);
+    s.description.split('\n').forEach(line => lines.push(`         ${line}`));
+    lines.push('');
+  });
+
+  lines.push('═══════════════════════════════════════════════════════════');
+
+  const report = lines.join('\n');
+  core.info(report);
+  core.endGroup();
+  return report;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STEP 5 — Post a rich summary (GitHub Step Summary + PR comment)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Writes a formatted Markdown summary to $GITHUB_STEP_SUMMARY and, when
+ * running in a pull-request context, posts or updates a PR comment via the
+ * GitHub REST API.
+ */
+async function postSummary(params) {
+  const {
+    wasmPath, sizeBytes, sizeLimitBytes, sizePercentage, status,
+    deltaBytes, baselineSizeBytes, compareBranch,
+    optimizationReport, isOverLimit, isWarning,
+  } = params;
+
+  core.startGroup('📊 Posting size report summary');
+
+  const statusEmoji = isOverLimit ? '❌' :

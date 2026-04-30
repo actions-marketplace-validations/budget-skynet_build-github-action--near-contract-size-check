@@ -3,27 +3,27 @@ description: "## Overview Create a GitHub Action that checks NEAR contract WASM 
 
 inputs:
   contract_path:
-    description: "Path to the NEAR contract directory or WASM file to check"
+    description: "Path to the NEAR contract directory containing Cargo.toml"
     required: true
     default: ''
-  size_limit_kb:
-    description: "Maximum contract size limit in kilobytes (NEAR standard is 4MB)"
+  size_limit_bytes:
+    description: "Maximum allowed WASM contract size in bytes (default NEAR limit is 50MB)"
     required: false
-    default: '4096'
+    default: '52428800'
   warning_threshold_percent:
     description: "Percentage of size limit to trigger warning (e.g., 80 for 80%)"
     required: false
     default: '80'
-  baseline_artifact:
-    description: "Previous build artifact or baseline size file for comparison"
+  compare_with_branch:
+    description: "Branch name to compare current size against for size regression detection"
     required: false
-    default: ''
-  fail_on_exceed:
-    description: "Whether to fail the workflow if contract exceeds size limit"
+    default: 'main'
+  fail_on_limit:
+    description: "Whether to fail the action if contract exceeds size limit"
     required: false
     default: 'true'
   optimization_suggestions:
-    description: "Enable automated optimization suggestions based on size analysis"
+    description: "Enable optimization suggestions in the output report"
     required: false
     default: 'true'
 
@@ -49,8 +49,8 @@ runs:
       run: cd ${{ github.action_path }} && node src/index.js
       env:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
-        INPUT_SIZE_LIMIT_KB: ${{ inputs.size_limit_kb }}
+        INPUT_SIZE_LIMIT_BYTES: ${{ inputs.size_limit_bytes }}
         INPUT_WARNING_THRESHOLD_PERCENT: ${{ inputs.warning_threshold_percent }}
-        INPUT_BASELINE_ARTIFACT: ${{ inputs.baseline_artifact }}
-        INPUT_FAIL_ON_EXCEED: ${{ inputs.fail_on_exceed }}
+        INPUT_COMPARE_WITH_BRANCH: ${{ inputs.compare_with_branch }}
+        INPUT_FAIL_ON_LIMIT: ${{ inputs.fail_on_limit }}
         INPUT_OPTIMIZATION_SUGGESTIONS: ${{ inputs.optimization_suggestions }}

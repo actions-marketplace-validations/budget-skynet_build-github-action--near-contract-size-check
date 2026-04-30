@@ -7,23 +7,23 @@ inputs:
     required: true
     default: ''
   size_limit_kb:
-    description: "Maximum allowed contract size in kilobytes (NEAR default is 4096)"
+    description: "Maximum allowed contract size in kilobytes (NEAR limit is typically 4MB)"
     required: false
     default: '4096'
   warning_threshold_percent:
-    description: "Percentage of size limit to trigger a warning (e.g., 80 for 80%)"
+    description: "Percentage of size limit to trigger warning (e.g., 80 for 80%)"
     required: false
     default: '80'
   baseline_artifact:
-    description: "GitHub Actions artifact name or path containing previous build WASM for comparis"
+    description: "GitHub Actions artifact name or commit SHA to compare against for size regressio"
     required: false
     default: ''
-  fail_on_limit_exceeded:
-    description: "Whether to fail the workflow if contract size exceeds limit"
+  fail_on_limit:
+    description: "Whether to fail the workflow if contract exceeds size limit"
     required: false
     default: 'true'
   optimization_suggestions:
-    description: "Enable automated optimization recommendations for oversized contracts"
+    description: "Enable automated optimization suggestions in the output"
     required: false
     default: 'true'
 
@@ -52,5 +52,5 @@ runs:
         INPUT_SIZE_LIMIT_KB: ${{ inputs.size_limit_kb }}
         INPUT_WARNING_THRESHOLD_PERCENT: ${{ inputs.warning_threshold_percent }}
         INPUT_BASELINE_ARTIFACT: ${{ inputs.baseline_artifact }}
-        INPUT_FAIL_ON_LIMIT_EXCEEDED: ${{ inputs.fail_on_limit_exceeded }}
+        INPUT_FAIL_ON_LIMIT: ${{ inputs.fail_on_limit }}
         INPUT_OPTIMIZATION_SUGGESTIONS: ${{ inputs.optimization_suggestions }}

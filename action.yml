@@ -1,0 +1,56 @@
+name: "Build GitHub Action: NEAR Contract Size Check"
+description: "## Overview Create a GitHub Action that checks NEAR contract WASM size and warns if approaching limits.  ## Why This Mat"
+
+inputs:
+  contract_path:
+    description: "Path to the NEAR contract directory or WASM file to check"
+    required: true
+    default: ''
+  size_limit_kb:
+    description: "Maximum allowed contract size in kilobytes before failing the action"
+    required: false
+    default: '4096'
+  warning_threshold_kb:
+    description: "Contract size in kilobytes that triggers a warning (should be less than size_lim"
+    required: false
+    default: '3500'
+  baseline_wasm_path:
+    description: "Path to previous/baseline WASM file for size comparison"
+    required: false
+    default: ''
+  fail_on_limit_exceed:
+    description: "Whether to fail the action if contract exceeds size limit"
+    required: false
+    default: 'true'
+  optimization_suggestions:
+    description: "Whether to include optimization suggestions in the output"
+    required: false
+    default: 'true'
+
+outputs:
+  result:
+    description: "Action execution result"
+  status:
+    description: "Pass or fail status"
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - name: Install dependencies
+      shell: bash
+      run: cd ${{ github.action_path }} && npm install --production
+    - name: Run action
+      shell: bash
+      id: run
+      run: cd ${{ github.action_path }} && node src/index.js
+      env:
+        INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
+        INPUT_SIZE_LIMIT_KB: ${{ inputs.size_limit_kb }}
+        INPUT_WARNING_THRESHOLD_KB: ${{ inputs.warning_threshold_kb }}
+        INPUT_BASELINE_WASM_PATH: ${{ inputs.baseline_wasm_path }}
+        INPUT_FAIL_ON_LIMIT_EXCEED: ${{ inputs.fail_on_limit_exceed }}
+        INPUT_OPTIMIZATION_SUGGESTIONS: ${{ inputs.optimization_suggestions }}

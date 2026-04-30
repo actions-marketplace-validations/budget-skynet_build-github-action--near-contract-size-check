@@ -7,23 +7,23 @@ inputs:
     required: true
     default: ''
   size_limit_kb:
-    description: "Maximum allowed contract size in kilobytes"
+    description: "Maximum allowed contract size in kilobytes before action fails"
     required: false
     default: '4096'
   warning_threshold_percent:
-    description: "Percentage of size limit to trigger warning (e.g., 80 for 80%)"
+    description: "Percentage of size limit at which to issue a warning (0-100)"
     required: false
-    default: '80'
-  baseline_wasm_url:
-    description: "URL or path to previous build WASM for size comparison"
+    default: '85'
+  baseline_wasm_path:
+    description: "Path to previous/baseline WASM file for size comparison"
     required: false
     default: ''
-  fail_on_limit_exceeded:
-    description: "Whether to fail the action if contract exceeds size limit"
+  optimization_suggestions:
+    description: "Enable optimization suggestions in output (true/false)"
     required: false
     default: 'true'
-  optimization_suggestions:
-    description: "Enable automated optimization suggestions based on size analysis"
+  fail_on_size_exceeded:
+    description: "Fail the action if contract size exceeds limit (true/false)"
     required: false
     default: 'true'
 
@@ -51,6 +51,6 @@ runs:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
         INPUT_SIZE_LIMIT_KB: ${{ inputs.size_limit_kb }}
         INPUT_WARNING_THRESHOLD_PERCENT: ${{ inputs.warning_threshold_percent }}
-        INPUT_BASELINE_WASM_URL: ${{ inputs.baseline_wasm_url }}
-        INPUT_FAIL_ON_LIMIT_EXCEEDED: ${{ inputs.fail_on_limit_exceeded }}
+        INPUT_BASELINE_WASM_PATH: ${{ inputs.baseline_wasm_path }}
         INPUT_OPTIMIZATION_SUGGESTIONS: ${{ inputs.optimization_suggestions }}
+        INPUT_FAIL_ON_SIZE_EXCEEDED: ${{ inputs.fail_on_size_exceeded }}

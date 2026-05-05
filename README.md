@@ -1,28 +1,29 @@
 # NEAR Contract Size Check
 
-Builds your NEAR smart contract and checks the WASM binary size against protocol limits. Fails the build if the contract exceeds the maximum allowed size and warns when approaching the threshold.
+Automatically builds your NEAR smart contract and validates the WASM binary size against deployment limits, preventing size-related failures before they reach production.
 
-## Why It Matters
+## Why This Matters
 
-NEAR enforces a 4MB contract size limit. Discovering an oversized contract at deployment wastes time and blocks releases. This action catches size issues early in CI.
+NEAR enforces a 4MB contract size limit. This action catches bloated contracts in CI, compares sizes across builds, and suggests optimizations before deployment fails.
 
 ## Inputs
 
-| Input | Description | Required | Default |
-|-------|-------------|----------|---------|
-| `contract-path` | Path to the contract directory | Yes | `.` |
-| `wasm-path` | Path to compiled WASM file | No | Auto-detected |
-| `max-size-kb` | Maximum allowed size in KB | No | `4096` |
-| `warn-size-kb` | Warning threshold in KB | No | `3500` |
-| `compare-baseline` | Compare size against previous build artifact | No | `false` |
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `contract-path` | Yes | `.` | Path to the contract directory |
+| `warn-threshold-kb` | No | `3584` | Warning threshold in KB (default: 3.5MB) |
+| `fail-threshold-kb` | No | `4096` | Hard limit in KB before action fails |
+| `optimize` | No | `true` | Run `wasm-opt` before size check |
+| `working-directory` | No | `.` | Root directory for the build |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `wasm-size-kb` | Compiled contract size in KB |
-| `size-status` | `ok`, `warning`, or `exceeded` |
-| `size-diff-kb` | Size difference from baseline build |
+| `wasm-size-kb` | Final WASM size in kilobytes |
+| `wasm-path` | Path to the compiled WASM file |
+| `size-status` | Result status: `ok`, `warning`, or `exceeded` |
+| `size-diff-kb` | Size difference compared to previous build |
 
 ## Usage
 
@@ -40,16 +41,15 @@ jobs:
         uses: your-org/near-contract-size-check@v1
         with:
           contract-path: ./contracts/my-contract
-          max-size-kb: 4096
-          warn-size-kb: 3500
-          compare-baseline: true
+          warn-threshold-kb: 3500
+          fail-threshold-kb: 4096
+          optimize: true
+
+      - name: Print Size
+        run: echo "Contract size ${{ steps.size-check.outputs.wasm-size-kb }}KB"
 
 ## Behavior
 
-- **OK** — Size is below the warning threshold
-- **Warning** — Size is between `warn-size-kb` and `max-size-kb`; build passes with an annotation
-- **Exceeded** — Size is above `max-size-kb`; build fails
-
-## Optimization Tips
-
-When the warning triggers, consider enabling `opt-level = "z"` in your `Cargo.toml`, removing unused dependencies, or using `wasm-opt` for additional compression.
+- **OK** — Size is below warn threshold, build passes
+- **Warning** — Approaching limit, build passes with annotation
+- **Exceeded** — Over fail threshold, build fails with optimization suggestions

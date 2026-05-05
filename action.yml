@@ -7,23 +7,23 @@ inputs:
     required: true
     default: ''
   size_limit_kb:
-    description: "Maximum allowed contract size in kilobytes before failing the check"
+    description: "Maximum allowed contract size in kilobytes before failing"
     required: false
     default: '4096'
   warning_threshold_percent:
-    description: "Percentage of size limit at which to issue a warning (e.g., 80 for 80%)"
+    description: "Percentage of size limit to trigger warning (e.g., 80 for 80%)"
     required: false
     default: '80'
-  baseline_artifact:
-    description: "Name of previous build artifact to compare against for size regression detection"
+  compare_with_branch:
+    description: "Git branch to compare contract size against for size regression detection"
     required: false
-    default: ''
-  fail_on_limit_exceeded:
-    description: "Whether to fail the action if contract exceeds size limit (true/false)"
+    default: 'main'
+  fail_on_size_increase:
+    description: "Whether to fail if contract size increased compared to baseline"
     required: false
-    default: 'true'
+    default: 'false'
   optimization_suggestions:
-    description: "Enable detailed optimization suggestions in output (true/false)"
+    description: "Enable automated optimization suggestions in comments"
     required: false
     default: 'true'
 
@@ -51,6 +51,6 @@ runs:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
         INPUT_SIZE_LIMIT_KB: ${{ inputs.size_limit_kb }}
         INPUT_WARNING_THRESHOLD_PERCENT: ${{ inputs.warning_threshold_percent }}
-        INPUT_BASELINE_ARTIFACT: ${{ inputs.baseline_artifact }}
-        INPUT_FAIL_ON_LIMIT_EXCEEDED: ${{ inputs.fail_on_limit_exceeded }}
+        INPUT_COMPARE_WITH_BRANCH: ${{ inputs.compare_with_branch }}
+        INPUT_FAIL_ON_SIZE_INCREASE: ${{ inputs.fail_on_size_increase }}
         INPUT_OPTIMIZATION_SUGGESTIONS: ${{ inputs.optimization_suggestions }}

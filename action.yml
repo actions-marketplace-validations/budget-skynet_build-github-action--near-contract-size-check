@@ -11,19 +11,19 @@ inputs:
     required: false
     default: '4096'
   warning_threshold_percent:
-    description: "Percentage of size limit to trigger warning (0-100)"
+    description: "Percentage of size limit at which to issue a warning (e.g., 80 for 80%)"
     required: false
     default: '80'
-  compare_with_main:
-    description: "Compare contract size with main branch to detect growth"
+  compare_with_previous:
+    description: "Enable comparison with previous build size from artifacts or git history"
     required: false
     default: 'true'
   optimization_suggestions:
-    description: "Include optimization suggestions in output for size reduction"
+    description: "Enable automated optimization suggestions for oversized contracts"
     required: false
     default: 'true'
-  fail_on_limit:
-    description: "Fail the action if contract size exceeds limit"
+  fail_on_limit_exceeded:
+    description: "Fail the workflow if contract size exceeds the limit"
     required: false
     default: 'true'
 
@@ -51,6 +51,6 @@ runs:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
         INPUT_SIZE_LIMIT_KB: ${{ inputs.size_limit_kb }}
         INPUT_WARNING_THRESHOLD_PERCENT: ${{ inputs.warning_threshold_percent }}
-        INPUT_COMPARE_WITH_MAIN: ${{ inputs.compare_with_main }}
+        INPUT_COMPARE_WITH_PREVIOUS: ${{ inputs.compare_with_previous }}
         INPUT_OPTIMIZATION_SUGGESTIONS: ${{ inputs.optimization_suggestions }}
-        INPUT_FAIL_ON_LIMIT: ${{ inputs.fail_on_limit }}
+        INPUT_FAIL_ON_LIMIT_EXCEEDED: ${{ inputs.fail_on_limit_exceeded }}

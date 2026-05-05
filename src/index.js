@@ -1,438 +1,444 @@
+async function execCapture(cmd, args = [], options = {}) {
+  let stdout = '';
+  let stderr = '';
+  const exitCode = await exec.exec(cmd, args, {
+    ...options,
+    silent: options.silent !== false,
+    listeners: {
+      stdout: (data) => { stdout += data.toString(); },
+      stderr: (data) => { stderr += data.toString(); },
+    },
+  });
+  return { exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
+}
+
+// ---------------------------------------------------------------------------
+// Utility – pretty-print bytes
+// ---------------------------------------------------------------------------
+function fmtBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(2)} KB`;
+  return `${(kb / 1024).toFixed(2)} MB`;
+}
+
+// ---------------------------------------------------------------------------
+// STEP 1 – Resolve contract path and find / build WASM
+// ---------------------------------------------------------------------------
 async function stepBuildContract(contractPath) {
-  core.startGroup('Step 1: Build Contract WASM');
+  core.startGroup('Step 1 – Build / locate contract WASM');
 
   const resolved = path.resolve(contractPath);
-  core.info(`Contract path: ${resolved}`);
+  core.info(`Contract path resolved: ${resolved}`);
 
   // If it's already a .wasm file, skip building
-  if (resolved.endsWith('.wasm')) {
-    if (!fs.existsSync(resolved)) {
-      throw new Error(`WASM file not found: ${resolved}`);
-    }
-    core.info(`Direct WASM file provided, skipping build.`);
+  if (resolved.endsWith('.wasm') && fs.existsSync(resolved)) {
+    core.info('Provided path is a WASM file – skipping build step.');
     core.endGroup();
-    return { wasmPath: resolved, builtFromSource: false };
+    return resolved;
   }
 
-  if (!fs.existsSync(resolved)) {
-    throw new Error(`Contract directory not found: ${resolved}`);
+  // Determine if it's a Rust project
+  const cargoToml = path.join(resolved, 'Cargo.toml');
+  const isRust = fs.existsSync(cargoToml);
+
+  if (isRust) {
+    core.info('Detected Rust/Cargo project – building WASM...');
+
+    // Ensure wasm target is installed
+    try {
+      await exec.exec('rustup', ['target', 'add', 'wasm32-unknown-unknown']);
+    } catch (e) {
+      core.warning(`rustup target add failed (might already exist): ${e.message}`);
+    }
+
+    // Read Cargo.toml to get package name
+    const cargoContent = fs.readFileSync(cargoToml, 'utf8');
+    const nameMatch = cargoContent.match(/^\s*name\s*=\s*"([^"]+)"/m);
+    const packageName = nameMatch ? nameMatch[1].replace(/-/g, '_') : null;
+
+    // Build release WASM
+    await exec.exec('cargo', ['build', '--target', 'wasm32-unknown-unknown', '--release'], {
+      cwd: resolved,
+    });
+
+    // Locate WASM output
+    const wasmDir = path.join(resolved, 'target', 'wasm32-unknown-unknown', 'release');
+    if (!fs.existsSync(wasmDir)) {
+      throw new Error(`Build output directory not found: ${wasmDir}`);
+    }
+
+    // Find the wasm file
+    let wasmFile = null;
+    if (packageName) {
+      const candidate = path.join(wasmDir, `${packageName}.wasm`);
+      if (fs.existsSync(candidate)) wasmFile = candidate;
+    }
+
+    if (!wasmFile) {
+      const files = fs.readdirSync(wasmDir).filter((f) => f.endsWith('.wasm') && !f.includes('.d.'));
+      if (files.length === 0) throw new Error('No WASM files found after build.');
+      // Prefer the largest (most likely the contract, not deps)
+      files.sort((a, b) => {
+        const sA = fs.statSync(path.join(wasmDir, a)).size;
+        const sB = fs.statSync(path.join(wasmDir, b)).size;
+        return sB - sA;
+      });
+      wasmFile = path.join(wasmDir, files[0]);
+    }
+
+    core.info(`Built WASM: ${wasmFile}`);
+    core.endGroup();
+    return wasmFile;
   }
 
-  // Detect project type
-  const hasCargoToml = fs.existsSync(path.join(resolved, 'Cargo.toml'));
-  const hasPackageJson = fs.existsSync(path.join(resolved, 'package.json'));
+  // Try glob search for any .wasm file under the directory
+  core.info('Not a Rust project – searching for pre-built WASM files...');
+  const globber = await glob.create(path.join(resolved, '**/*.wasm'));
+  const wasmFiles = await globber.glob();
 
-  let wasmPath = null;
-
-  if (hasCargoToml) {
-    core.info('Detected Rust/NEAR contract. Building with cargo...');
-
-    // Ensure wasm32 target is available
-    const targetCheck = exec('rustup target list --installed');
-    if (!targetCheck.stdout.includes('wasm32-unknown-unknown')) {
-      core.info('Adding wasm32-unknown-unknown target...');
-      const addTarget = exec('rustup target add wasm32-unknown-unknown');
-      if (addTarget.code !== 0) {
-        throw new Error('Failed to add wasm32-unknown-unknown target');
-      }
-    }
-
-    // Try cargo-near first, then fall back to standard cargo build
-    const cargoNearCheck = exec('cargo near --version');
-    if (cargoNearCheck.code === 0) {
-      core.info('Building with cargo-near...');
-      const buildResult = exec('cargo near build', { cwd: resolved });
-      if (buildResult.code !== 0) {
-        core.warning(`cargo-near build failed, falling back to cargo build`);
-      }
-    }
-
-    // Standard cargo build with WASM target
-    core.info('Building with cargo build --release --target wasm32-unknown-unknown...');
-    const cargoResult = exec(
-      'cargo build --release --target wasm32-unknown-unknown',
-      { cwd: resolved }
+  if (wasmFiles.length === 0) {
+    throw new Error(
+      `No WASM files found under "${resolved}". ` +
+      'Provide a Cargo.toml project directory or a direct path to a .wasm file.'
     );
-    if (cargoResult.code !== 0) {
-      throw new Error(`Cargo build failed.\nOutput: ${cargoResult.stdout}\nError: ${cargoResult.stderr}`);
-    }
-
-    // Find the produced WASM
-    const targetDir = path.join(resolved, 'target', 'wasm32-unknown-unknown', 'release');
-    const wasmFiles = findWasmFiles(targetDir);
-
-    // Filter out test/deps wasm
-    const contractWasms = wasmFiles.filter(
-      (f) => !f.includes('/deps/') && !f.endsWith('-test.wasm')
-    );
-
-    if (contractWasms.length === 0) {
-      // Also check res/ directory (common NEAR pattern)
-      const resDir = path.join(resolved, 'res');
-      const resWasms = fs.existsSync(resDir) ? findWasmFiles(resDir) : [];
-      if (resWasms.length > 0) {
-        wasmPath = resWasms[0];
-      } else {
-        throw new Error(`No WASM file found after build in ${targetDir}`);
-      }
-    } else {
-      // Pick the largest one (most likely the main contract)
-      contractWasms.sort((a, b) => fileSize(b) - fileSize(a));
-      wasmPath = contractWasms[0];
-    }
-  } else if (hasPackageJson) {
-    core.info('Detected JavaScript/TypeScript NEAR contract. Building with npm...');
-
-    const installResult = exec('npm install', { cwd: resolved });
-    if (installResult.code !== 0) {
-      throw new Error(`npm install failed: ${installResult.stderr}`);
-    }
-
-    // Try common build scripts
-    const pkg = JSON.parse(fs.readFileSync(path.join(resolved, 'package.json'), 'utf8'));
-    const scripts = pkg.scripts || {};
-
-    let buildCmd = null;
-    for (const s of ['build', 'compile', 'build:release']) {
-      if (scripts[s]) { buildCmd = s; break; }
-    }
-
-    if (buildCmd) {
-      const buildResult = exec(`npm run ${buildCmd}`, { cwd: resolved });
-      if (buildResult.code !== 0) {
-        throw new Error(`npm run ${buildCmd} failed: ${buildResult.stderr}`);
-      }
-    } else {
-      // Try near-sdk-js or assemblyscript
-      const asCheck = exec('npx asc --version');
-      if (asCheck.code === 0) {
-        const asResult = exec('npx asc assembly/index.ts --target release -o build/contract.wasm', { cwd: resolved });
-        if (asResult.code !== 0) {
-          throw new Error(`AssemblyScript build failed: ${asResult.stderr}`);
-        }
-      }
-    }
-
-    // Find produced WASM
-    const wasmFiles = findWasmFiles(resolved);
-    const filtered = wasmFiles.filter((f) => !f.includes('node_modules'));
-    if (filtered.length === 0) {
-      throw new Error(`No WASM file found after JS build in ${resolved}`);
-    }
-    filtered.sort((a, b) => fileSize(b) - fileSize(a));
-    wasmPath = filtered[0];
-  } else {
-    // Try to find existing WASM
-    const wasmFiles = findWasmFiles(resolved);
-    if (wasmFiles.length > 0) {
-      wasmFiles.sort((a, b) => fileSize(b) - fileSize(a));
-      wasmPath = wasmFiles[0];
-      core.info(`Found pre-built WASM: ${wasmPath}`);
-    } else {
-      throw new Error(
-        `Cannot determine project type in ${resolved}. ` +
-        `No Cargo.toml, package.json, or .wasm files found.`
-      );
-    }
   }
 
-  core.info(`✅ WASM artifact: ${wasmPath} (${formatBytes(fileSize(wasmPath))})`);
+  // Sort by size descending, take the largest
+  wasmFiles.sort((a, b) => fs.statSync(b).size - fs.statSync(a).size);
+  const wasmFile = wasmFiles[0];
+  core.info(`Found WASM: ${wasmFile} (${wasmFiles.length} total)`);
   core.endGroup();
-  return { wasmPath, builtFromSource: true };
+  return wasmFile;
 }
 
-// ─── Step 2: Check Size Against Limits ──────────────────────────────────────
+// ---------------------------------------------------------------------------
+// STEP 2 – Check size against limits
+// ---------------------------------------------------------------------------
+async function stepCheckSize(wasmFile, sizeLimitKb, warningThresholdPercent) {
+  core.startGroup('Step 2 – Check contract size');
 
-async function stepCheckSize(wasmPath, sizeLimitKB, warningThresholdPercent) {
-  core.startGroup('Step 2: Check Contract Size Against Limits');
+  if (!fs.existsSync(wasmFile)) {
+    throw new Error(`WASM file not found: ${wasmFile}`);
+  }
 
-  const sizeBytes = fileSize(wasmPath);
-  const sizeKB = bytesToKB(sizeBytes);
-  const limitBytes = sizeLimitKB * 1024;
+  const stats = fs.statSync(wasmFile);
+  const sizeBytes = stats.size;
+  const sizeKb = sizeBytes / 1024;
+
+  const limitBytes = sizeLimitKb * 1024;
   const warningBytes = limitBytes * (warningThresholdPercent / 100);
-  const usagePercent = (sizeBytes / limitBytes) * 100;
+  const percentUsed = (sizeBytes / limitBytes) * 100;
 
-  core.info(`Contract WASM: ${wasmPath}`);
-  core.info(`Size:          ${formatBytes(sizeBytes)} (${sizeKB.toFixed(2)} KB)`);
-  core.info(`Limit:         ${formatBytes(limitBytes)} (${sizeLimitKB} KB)`);
-  core.info(`Warning at:    ${formatBytes(warningBytes)} (${warningThresholdPercent}% of limit)`);
-  core.info(`Usage:         ${usagePercent.toFixed(1)}% ${bar(usagePercent)}`);
+  core.info(`Contract WASM:     ${wasmFile}`);
+  core.info(`Size:              ${fmtBytes(sizeBytes)} (${sizeKb.toFixed(2)} KB)`);
+  core.info(`Size limit:        ${fmtBytes(limitBytes)} (${sizeLimitKb} KB)`);
+  core.info(`Warning threshold: ${warningThresholdPercent}% = ${fmtBytes(warningBytes)}`);
+  core.info(`Usage:             ${percentUsed.toFixed(1)}%`);
+
+  // NEAR protocol hard limit check
+  if (sizeKb > NEAR_HARD_LIMIT_KB) {
+    core.error(
+      `🚫 Contract size ${fmtBytes(sizeBytes)} exceeds NEAR protocol hard limit of ${NEAR_HARD_LIMIT_KB} KB!`
+    );
+  }
 
   const isOverLimit = sizeBytes > limitBytes;
-  const isNearLimit = sizeBytes > warningBytes;
-
-  // Set outputs
-  core.setOutput('contract_size_bytes', sizeBytes.toString());
-  core.setOutput('contract_size_kb', sizeKB.toFixed(2));
-  core.setOutput('size_limit_kb', sizeLimitKB.toString());
-  core.setOutput('usage_percent', usagePercent.toFixed(1));
-  core.setOutput('is_over_limit', isOverLimit.toString());
-  core.setOutput('is_near_limit', isNearLimit.toString());
+  const isOverWarning = sizeBytes >= warningBytes && !isOverLimit;
 
   if (isOverLimit) {
-    const excess = sizeBytes - limitBytes;
-    core.error(
-      `❌ Contract size ${formatBytes(sizeBytes)} EXCEEDS limit of ${formatBytes(limitBytes)} ` +
-      `(over by ${formatBytes(excess)})`
-    );
-  } else if (isNearLimit) {
-    const remaining = limitBytes - sizeBytes;
+    core.error(`❌ Contract size ${fmtBytes(sizeBytes)} exceeds the configured limit of ${fmtBytes(limitBytes)}`);
+  } else if (isOverWarning) {
     core.warning(
-      `⚠️  Contract size ${formatBytes(sizeBytes)} is approaching limit ` +
-      `(${usagePercent.toFixed(1)}% used, ${formatBytes(remaining)} remaining)`
+      `⚠️ Contract size ${fmtBytes(sizeBytes)} is above ${warningThresholdPercent}% of the limit ` +
+      `(${fmtBytes(limitBytes)}). Consider optimizing.`
     );
   } else {
-    const remaining = limitBytes - sizeBytes;
-    core.info(`✅ Contract size is within limits (${formatBytes(remaining)} remaining)`);
+    core.info(`✅ Contract size is within limits.`);
   }
+
+  // Set outputs
+  core.setOutput('contract_size_bytes', String(sizeBytes));
+  core.setOutput('contract_size_kb', sizeKb.toFixed(2));
+  core.setOutput('size_limit_kb', String(sizeLimitKb));
+  core.setOutput('percent_of_limit', percentUsed.toFixed(1));
+  core.setOutput('size_check_passed', String(!isOverLimit));
 
   core.endGroup();
-  return { sizeBytes, sizeKB, usagePercent, isOverLimit, isNearLimit, limitBytes, warningBytes };
+
+  return {
+    wasmFile,
+    sizeBytes,
+    sizeKb,
+    limitBytes,
+    limitKb: sizeLimitKb,
+    warningBytes,
+    warningThresholdPercent,
+    percentUsed,
+    isOverLimit,
+    isOverWarning,
+  };
 }
 
-// ─── Step 3: Compare With Previous Builds ───────────────────────────────────
+// ---------------------------------------------------------------------------
+// STEP 3 – Compare with previous builds (artifacts via GitHub API)
+// ---------------------------------------------------------------------------
+async function stepCompareWithPrevious(sizeInfo, token) {
+  core.startGroup('Step 3 – Compare with previous builds');
 
-async function stepCompareWithMain(wasmPath, sizeBytes, compareWithMain) {
-  core.startGroup('Step 3: Compare With Previous Builds');
-
-  if (!compareWithMain) {
-    core.info('Comparison with main branch disabled, skipping.');
-    core.endGroup();
-    return { delta: null, deltaKB: null, previousSizeBytes: null };
-  }
-
+  const { sizeBytes, wasmFile } = sizeInfo;
+  const wasmName = path.basename(wasmFile);
   let previousSizeBytes = null;
   let delta = null;
-  let deltaKB = null;
+  let deltaPercent = null;
+  let trend = 'unknown';
+
+  if (!token) {
+    core.warning('No GITHUB_TOKEN provided – skipping artifact comparison.');
+    core.endGroup();
+    return { previousSizeBytes, delta, deltaPercent, trend };
+  }
 
   try {
-    // Check if we're in a git repo
-    const gitCheck = exec('git rev-parse --is-inside-work-tree');
-    if (gitCheck.code !== 0) {
-      core.info('Not in a git repository, skipping comparison.');
-      core.endGroup();
-      return { delta: null, deltaKB: null, previousSizeBytes: null };
-    }
+    const octokit = github.getOctokit(token);
+    const { repo: { owner, repo }, runId } = github.context;
 
-    // Get current branch
-    const branchResult = exec('git rev-parse --abbrev-ref HEAD');
-    const currentBranch = branchResult.stdout.trim();
-    core.info(`Current branch: ${currentBranch}`);
+    // List artifacts from recent workflow runs
+    core.info('Fetching recent workflow runs...');
+    const { data: runsData } = await octokit.rest.actions.listWorkflowRunsForRepo({
+      owner,
+      repo,
+      status: 'success',
+      per_page: 10,
+    });
 
-    if (currentBranch === 'main' || currentBranch === 'master') {
-      core.info('Already on main/master branch. Comparing with previous commit...');
+    const runs = (runsData.workflow_runs || []).filter((r) => r.id !== runId);
+    core.info(`Found ${runs.length} previous successful runs to search.`);
 
-      // Compare with previous commit on main
-      const prevCommit = exec('git rev-parse HEAD~1');
-      if (prevCommit.code !== 0) {
-        core.info('No previous commit found.');
-        core.endGroup();
-        return { delta: null, deltaKB: null, previousSizeBytes: null };
-      }
+    for (const run of runs) {
+      try {
+        const { data: artifactsData } = await octokit.rest.actions.listWorkflowRunArtifacts({
+          owner,
+          repo,
+          run_id: run.id,
+        });
 
-      const stashResult = exec('git stash');
-      const checkoutResult = exec(`git checkout HEAD~1 -- ${wasmPath} 2>/dev/null || true`);
+        const artifact = (artifactsData.artifacts || []).find(
+          (a) => a.name === ARTIFACT_NAME && !a.expired
+        );
 
-      if (fs.existsSync(wasmPath)) {
-        previousSizeBytes = fileSize(wasmPath);
-      }
+        if (!artifact) continue;
 
-      // Restore
-      exec(`git checkout HEAD -- ${wasmPath} 2>/dev/null || true`);
-      if (stashResult.stdout.includes('Saved')) {
-        exec('git stash pop');
-      }
-    } else {
-      // Try to fetch and compare with main/master
-      const fetchMain = exec('git fetch origin main:refs/remotes/origin/main 2>/dev/null || git fetch origin master:refs/remotes/origin/master 2>/dev/null || true');
-      core.info('Fetched remote branches.');
+        core.info(`Found size artifact in run #${run.run_number} (${run.created_at})`);
 
-      // Try to get the WASM from main branch using git show
-      const relativeWasm = path.relative(process.cwd(), wasmPath);
+        // Download artifact zip
+        const { data: zipData } = await octokit.rest.actions.downloadArtifact({
+          owner,
+          repo,
+          artifact_id: artifact.id,
+          archive_format: 'zip',
+        });
 
-      // Check if file exists on main
-      const mainFileCheck = exec(`git show origin/main:${relativeWasm} > /tmp/main_contract.wasm 2>/dev/null || git show origin/master:${relativeWasm} > /tmp/main_contract.wasm 2>/dev/null`);
+        // Parse the zip to find the JSON size data
+        // Since we can't use unzipper (external dep), we'll parse the zip buffer manually
+        // using a lightweight approach
+        const zipBuffer = Buffer.from(zipData);
+        const sizeDataStr = extractJsonFromZip(zipBuffer);
 
-      if (mainFileCheck.code === 0 && fs.existsSync('/tmp/main_contract.wasm')) {
-        previousSizeBytes = fileSize('/tmp/main_contract.wasm');
-        core.info(`Found WASM on main branch: ${formatBytes(previousSizeBytes)}`);
-      } else {
-        // Try GitHub API to get artifact size from last successful run
-        core.info('WASM not found in git history. Trying GitHub Actions artifacts...');
-
-        const token = process.env.GITHUB_TOKEN;
-        const repo = process.env.GITHUB_REPOSITORY;
-
-        if (token && repo) {
-          try {
-            const apiUrl = `https://api.github.com/repos/${repo}/actions/runs?branch=main&status=success&per_page=1`;
-            const response = await httpGet(apiUrl);
-
-            if (response.status === 200) {
-              const runs = JSON.parse(response.body);
-              if (runs.workflow_runs && runs.workflow_runs.length > 0) {
-                core.info(`Found previous successful run: ${runs.workflow_runs[0].id}`);
-                // Store in output for reference
-                core.setOutput('previous_run_id', runs.workflow_runs[0].id.toString());
-              }
-            }
-          } catch (apiErr) {
-            core.info(`GitHub API call failed: ${apiErr.message}`);
+        if (sizeDataStr) {
+          const sizeData = JSON.parse(sizeDataStr);
+          if (sizeData.sizeBytes && sizeData.wasmName === wasmName) {
+            previousSizeBytes = sizeData.sizeBytes;
+            break;
           }
         }
-
-        // Check for cached size file
-        const cachePath = '/tmp/near_contract_size_cache.json';
-        if (fs.existsSync(cachePath)) {
-          try {
-            const cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-            if (cache.main_size_bytes) {
-              previousSizeBytes = cache.main_size_bytes;
-              core.info(`Using cached main branch size: ${formatBytes(previousSizeBytes)}`);
-            }
-          } catch (e) {
-            core.info('Cache file unreadable.');
-          }
-        }
+      } catch (artifactErr) {
+        core.debug(`Error checking run ${run.id}: ${artifactErr.message}`);
       }
-    }
-
-    if (previousSizeBytes !== null) {
-      delta = sizeBytes - previousSizeBytes;
-      deltaKB = bytesToKB(delta);
-      const sign = delta >= 0 ? '+' : '';
-
-      core.info(`Previous size: ${formatBytes(previousSizeBytes)}`);
-      core.info(`Current size:  ${formatBytes(sizeBytes)}`);
-      core.info(`Delta:         ${sign}${formatBytes(Math.abs(delta))} (${sign}${deltaKB.toFixed(2)} KB)`);
-
-      if (delta > 0) {
-        core.warning(`⚠️  Contract grew by ${formatBytes(delta)} compared to main branch`);
-      } else if (delta < 0) {
-        core.info(`✅ Contract shrank by ${formatBytes(Math.abs(delta))} compared to main branch`);
-      } else {
-        core.info(`✅ Contract size unchanged from main branch`);
-      }
-
-      core.setOutput('size_delta_bytes', delta.toString());
-      core.setOutput('size_delta_kb', deltaKB.toFixed(2));
-      core.setOutput('previous_size_bytes', previousSizeBytes.toString());
-    } else {
-      core.info('No previous build found for comparison. This may be the first build.');
-      core.setOutput('size_delta_bytes', '0');
-      core.setOutput('size_delta_kb', '0');
-      core.setOutput('previous_size_bytes', '0');
     }
   } catch (err) {
-    core.warning(`Comparison step encountered an error: ${err.message}`);
+    core.warning(`Could not fetch previous size data: ${err.message}`);
   }
 
-  core.endGroup();
-  return { delta, deltaKB, previousSizeBytes };
-}
-
-// ─── Step 4: Suggest Optimizations ──────────────────────────────────────────
-
-async function stepSuggestOptimizations(wasmPath, sizeBytes, isOverLimit, isNearLimit, includeOptimizations) {
-  core.startGroup('Step 4: Optimization Suggestions');
-
-  if (!includeOptimizations) {
-    core.info('Optimization suggestions disabled, skipping.');
-    core.endGroup();
-    return { suggestions: [] };
-  }
-
-  const suggestions = [];
-  const sizeKB = bytesToKB(sizeBytes);
-
-  core.info(`Analyzing WASM file for optimization opportunities...`);
-
-  // Check if wasm-opt is available
-  const wasmOptCheck = exec('wasm-opt --version');
-  const hasWasmOpt = wasmOptCheck.code === 0;
-
-  // Check if wasm-snip is available
-  const wasmSnipCheck = exec('wasm-snip --version 2>/dev/null');
-  const hasWasmSnip = wasmSnipCheck.code === 0;
-
-  // Try to run wasm-opt to see potential savings
-  let optimizedSize = null;
-  if (hasWasmOpt) {
-    core.info('Running wasm-opt analysis (dry run)...');
-    const optOutput = '/tmp/contract_optimized.wasm';
-    const optResult = exec(`wasm-opt -Oz --strip-debug --strip-producers ${wasmPath} -o ${optOutput}`);
-
-    if (optResult.code === 0 && fs.existsSync(optOutput)) {
-      optimizedSize = fileSize(optOutput);
-      const savings = sizeBytes - optimizedSize;
-      const savingsPercent = (savings / sizeBytes) * 100;
-
-      if (savings > 0) {
-        suggestions.push({
-          priority: 'HIGH',
-          title: 'Run wasm-opt',
-          description: `wasm-opt -Oz can reduce size by ~${formatBytes(savings)} (${savingsPercent.toFixed(1)}%)`,
-          command: `wasm-opt -Oz --strip-debug --strip-producers ${path.basename(wasmPath)} -o ${path.basename(wasmPath)}`,
-          savings_bytes: savings,
-        });
+  // Also check local cache file as fallback
+  if (previousSizeBytes === null) {
+    const cacheFile = path.join(os.tmpdir(), SIZE_CACHE_FILE);
+    if (fs.existsSync(cacheFile)) {
+      try {
+        const cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        if (cache.sizeBytes && cache.wasmName === path.basename(wasmFile)) {
+          previousSizeBytes = cache.sizeBytes;
+          core.info(`Using local cache for comparison: ${fmtBytes(previousSizeBytes)}`);
+        }
+      } catch (e) {
+        core.debug(`Cache read error: ${e.message}`);
       }
-      // Clean up
-      fs.unlinkSync(optOutput);
+    }
+  }
+
+  if (previousSizeBytes !== null) {
+    delta = sizeBytes - previousSizeBytes;
+    deltaPercent = previousSizeBytes > 0 ? (delta / previousSizeBytes) * 100 : 0;
+
+    if (delta > 0) {
+      trend = 'increasing';
+      core.warning(
+        `📈 Contract grew by ${fmtBytes(Math.abs(delta))} (+${deltaPercent.toFixed(1)}%) ` +
+        `compared to previous build (${fmtBytes(previousSizeBytes)} → ${fmtBytes(sizeBytes)})`
+      );
+    } else if (delta < 0) {
+      trend = 'decreasing';
+      core.info(
+        `📉 Contract shrank by ${fmtBytes(Math.abs(delta))} (${deltaPercent.toFixed(1)}%) ` +
+        `compared to previous build (${fmtBytes(previousSizeBytes)} → ${fmtBytes(sizeBytes)})`
+      );
+    } else {
+      trend = 'stable';
+      core.info(`📊 Contract size unchanged from previous build (${fmtBytes(sizeBytes)})`);
     }
   } else {
-    suggestions.push({
-      priority: 'HIGH',
-      title: 'Install and run wasm-opt',
-      description: 'wasm-opt from binaryen toolkit can significantly reduce WASM size (often 20-40%)',
-      command: 'apt-get install -y binaryen && wasm-opt -Oz --strip-debug contract.wasm -o contract.wasm',
-      savings_bytes: null,
-    });
+    core.info('No previous size data found – this appears to be the first run.');
   }
 
-  // Check Cargo.toml for optimization settings
-  const contractDir = path.dirname(wasmPath);
-  let cargoTomlPath = path.join(contractDir, 'Cargo.toml');
+  // Save current size data for next comparison
+  const sizeRecord = {
+    sizeBytes,
+    sizeKb: sizeBytes / 1024,
+    wasmName: path.basename(wasmFile),
+    timestamp: new Date().toISOString(),
+    runId: github.context.runId,
+    sha: github.context.sha,
+  };
 
-  // Walk up to find Cargo.toml
-  let searchDir = contractDir;
-  for (let i = 0; i < 5; i++) {
-    const candidate = path.join(searchDir, 'Cargo.toml');
-    if (fs.existsSync(candidate)) {
-      cargoTomlPath = candidate;
-      break;
-    }
-    searchDir = path.dirname(searchDir);
-  }
+  const tmpDir = path.join(os.tmpdir(), 'near-size-artifact');
+  await io.mkdirP(tmpDir);
+  fs.writeFileSync(path.join(tmpDir, 'size-data.json'), JSON.stringify(sizeRecord, null, 2));
 
-  if (fs.existsSync(cargoTomlPath)) {
-    const cargoContent = fs.readFileSync(cargoTomlPath, 'utf8');
+  // Set outputs for comparison
+  core.setOutput('previous_size_bytes', previousSizeBytes !== null ? String(previousSizeBytes) : '');
+  core.setOutput('size_delta_bytes', delta !== null ? String(delta) : '');
+  core.setOutput('size_trend', trend);
 
-    if (!cargoContent.includes('opt-level')) {
-      suggestions.push({
-        priority: 'HIGH',
-        title: 'Add release profile optimizations to Cargo.toml',
-        description: 'Configure Cargo release profile for size optimization',
-        command: null,
-        code: `[profile.release]
-codegen-units = 1
-opt-level = "z"
-lto = true
-debug = false
-panic = "abort"
-strip = "symbols"`,
-        savings_bytes: null,
-      });
-    } else {
-      // Check if opt-level is set to "z" or "s"
-      if (!cargoContent.includes('opt-level = "z"') && !cargoContent.includes("opt-level = 's'") && !cargoContent.includes('opt-level = "s"')) {
-        suggestions.push({
-          priority: 'MEDIUM',
-          title: 'Use opt-level = "z" for minimum size',
-          description: 'opt-level = "z" optimizes specifically for size (smaller than "s")',
-          command: null,
-          code: `[profile.release]\nopt-level = "z"`,
-          savings_bytes: null,
-        });
+  core.endGroup();
+  return { previousSizeBytes, delta, deltaPercent, trend, artifactDir: path.join(os.tmpdir(), 'near-size-artifact') };
+}
+
+// ---------------------------------------------------------------------------
+// Minimal ZIP parser to extract first JSON file content
+// ---------------------------------------------------------------------------
+function extractJsonFromZip(buffer) {
+  try {
+    // ZIP local file header signature: PK\x03\x04
+    let offset = 0;
+    while (offset < buffer.length - 30) {
+      if (
+        buffer[offset] === 0x50 &&
+        buffer[offset + 1] === 0x4b &&
+        buffer[offset + 2] === 0x03 &&
+        buffer[offset + 3] === 0x04
+      ) {
+        const compressionMethod = buffer.readUInt16LE(offset + 8);
+        const compressedSize = buffer.readUInt32LE(offset + 18);
+        const filenameLen = buffer.readUInt16LE(offset + 26);
+        const extraLen = buffer.readUInt16LE(offset + 28);
+        const filename = buffer.slice(offset + 30, offset + 30 + filenameLen).toString('utf8');
+        const dataOffset = offset + 30 + filenameLen + extraLen;
+
+        if (filename.endsWith('.json') && compressionMethod === 0) {
+          // Stored (no compression)
+          return buffer.slice(dataOffset, dataOffset + compressedSize).toString('utf8');
+        }
+
+        offset = dataOffset + compressedSize;
+      } else {
+        offset++;
       }
+    }
+  } catch (e) {
+    // Ignore parse errors
+  }
+  return null;
+}
 
-      if (!cargoContent.includes('
+// ---------------------------------------------------------------------------
+// STEP 4 – Suggest optimizations
+// ---------------------------------------------------------------------------
+async function stepSuggestOptimizations(sizeInfo, comparisonInfo) {
+  core.startGroup('Step 4 – Optimization suggestions');
+
+  const { sizeBytes, limitBytes, isOverLimit, isOverWarning, wasmFile } = sizeInfo;
+  const { delta, trend } = comparisonInfo;
+
+  const suggestions = [];
+
+  // Always check if wasm-opt is available and run it for analysis
+  let wasmOptAvailable = false;
+  try {
+    await io.which('wasm-opt', true);
+    wasmOptAvailable = true;
+  } catch (e) {
+    core.info('wasm-opt not found in PATH – skipping wasm-opt analysis.');
+  }
+
+  let wasmOptSize = null;
+  if (wasmOptAvailable) {
+    try {
+      const optimizedPath = wasmFile.replace('.wasm', '.opt.wasm');
+      const { exitCode } = await execCapture('wasm-opt', [
+        wasmFile,
+        '-Oz',
+        '--strip-debug',
+        '--strip-producers',
+        '-o',
+        optimizedPath,
+      ]);
+      if (exitCode === 0 && fs.existsSync(optimizedPath)) {
+        wasmOptSize = fs.statSync(optimizedPath).size;
+        const saving = sizeBytes - wasmOptSize;
+        const savingPct = ((saving / sizeBytes) * 100).toFixed(1);
+        core.info(`wasm-opt (-Oz) result: ${fmtBytes(wasmOptSize)} (saves ${fmtBytes(saving)}, ${savingPct}%)`);
+        core.setOutput('wasm_opt_size_bytes', String(wasmOptSize));
+
+        if (saving > 0) {
+          suggestions.push(
+            `🔧 **Run wasm-opt -Oz**: Could save ~${fmtBytes(saving)} (${savingPct}%). ` +
+            `Install binaryen and add wasm-opt to your build pipeline.`
+          );
+        }
+        // Clean up optimized file
+        fs.unlinkSync(optimizedPath);
+      }
+    } catch (e) {
+      core.debug(`wasm-opt analysis failed: ${e.message}`);
+    }
+  } else {
+    suggestions.push(
+      '🔧 **Install wasm-opt (binaryen)**: Add `wasm-opt -Oz --strip-debug -o contract.wasm contract.wasm` ' +
+      'to your build. Typically reduces WASM size by 20-40%.'
+    );
+  }
+
+  // Check for debug symbols in WASM
+  try {
+    const wasmContent = fs.readFileSync(wasmFile);
+    const wasmStr = wasmContent.toString('binary');
+    const hasDebugSections = wasmStr.includes('.debug_') || wasmStr.includes('name section');
+    if (hasDebugSections) {
+      suggestions.push(
+        '🐛 **Strip debug symbols**: Debug sections detected. Use `wasm-opt --strip-debug` or ' +
+        'add `[profile.release]\ndebug = false` to Cargo.toml.'
+      );
+    }
+  } catch (e) {
+    core.debug(`Debug symbol check failed: ${e.message}`);
+  }
+
+  // Cargo.toml optimization suggestions
+  const contractDir = path.dirname(wasmFile).replace(/[\\/]target[\\/].*/, '');
+  const cargoToml = path.join(contractDir, 'Cargo.toml');
+  if (fs.existsSync(cargoToml)) {
+    const cargoContent = fs.readFileSync(cargoToml, 'utf8');
+
+    if (!cargoContent.includes('[profile.release]')) {
+      suggestions.push(
+        '📦 **Add release profile to Cargo.toml**:\n

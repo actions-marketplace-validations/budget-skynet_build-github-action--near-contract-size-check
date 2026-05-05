@@ -1,29 +1,28 @@
 # NEAR Contract Size Check
 
-Builds your NEAR smart contract and checks the WASM binary size against protocol limits. Fails CI if the contract exceeds the maximum size and warns when approaching the threshold.
+Builds your NEAR smart contract and checks the WASM binary size against protocol limits. Fails the build if the contract exceeds the maximum allowed size and warns when approaching the threshold.
 
 ## Why It Matters
 
-NEAR enforces a 4MB contract size limit. Exceeding it causes deployment failures. This action catches size issues early in CI before they reach production.
+NEAR enforces a 4MB contract size limit. Discovering an oversized contract at deployment wastes time and blocks releases. This action catches size issues early in CI.
 
 ## Inputs
 
-| Input | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `contract-path` | No | `.` | Path to the contract directory |
-| `max-size-kb` | No | `4096` | Maximum allowed size in KB |
-| `warn-threshold-percent` | No | `80` | Warn when size exceeds this % of max |
-| `compare-base-branch` | No | `main` | Branch to compare size against |
-| `fail-on-increase` | No | `false` | Fail if size increased vs base branch |
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `contract-path` | Path to the contract directory | Yes | `.` |
+| `wasm-path` | Path to compiled WASM file | No | Auto-detected |
+| `max-size-kb` | Maximum allowed size in KB | No | `4096` |
+| `warn-size-kb` | Warning threshold in KB | No | `3500` |
+| `compare-baseline` | Compare size against previous build artifact | No | `false` |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `wasm-size-kb` | Compiled WASM size in KB |
-| `size-percent` | Percentage of limit used |
-| `size-diff-kb` | Size difference vs base branch |
-| `status` | `ok`, `warning`, or `exceeded` |
+| `wasm-size-kb` | Compiled contract size in KB |
+| `size-status` | `ok`, `warning`, or `exceeded` |
+| `size-diff-kb` | Size difference from baseline build |
 
 ## Usage
 
@@ -42,19 +41,15 @@ jobs:
         with:
           contract-path: ./contracts/my-contract
           max-size-kb: 4096
-          warn-threshold-percent: 80
-          compare-base-branch: main
-          fail-on-increase: false
+          warn-size-kb: 3500
+          compare-baseline: true
+
+## Behavior
+
+- **OK** — Size is below the warning threshold
+- **Warning** — Size is between `warn-size-kb` and `max-size-kb`; build passes with an annotation
+- **Exceeded** — Size is above `max-size-kb`; build fails
 
 ## Optimization Tips
 
-When the action warns about size, consider:
-
-- Enable `opt-level = "z"` in `Cargo.toml`
-- Add `lto = true` under `[profile.release]`
-- Remove unused dependencies
-- Run `wasm-opt` with `-Oz` flag
-
-## License
-
-MIT
+When the warning triggers, consider enabling `opt-level = "z"` in your `Cargo.toml`, removing unused dependencies, or using `wasm-opt` for additional compression.

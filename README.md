@@ -1,19 +1,19 @@
 # NEAR Contract Size Check
 
-Builds your NEAR smart contract and validates the WASM binary size against protocol limits. Fails the workflow if the contract exceeds the maximum allowed size and warns when approaching the threshold.
+Builds your NEAR smart contract and checks the WASM binary size against protocol limits. Fails the workflow if the contract exceeds the maximum allowed size and warns when approaching the threshold.
 
 ## Why It Matters
 
-NEAR enforces a 4MB contract size limit. Catching oversized contracts in CI prevents failed deployments and gives early feedback on binary bloat before it becomes a problem.
+NEAR enforces a 4MB contract size limit. Discovering oversized contracts at deployment time wastes time and blocks releases. This action catches size issues early in CI.
 
 ## Inputs
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `contract-path` | Path to the contract directory | No | `.` |
+| `contract-path` | Path to the contract directory | Yes | `.` |
 | `wasm-path` | Path to compiled WASM file | No | Auto-detected |
 | `max-size-kb` | Maximum allowed size in KB | No | `4096` |
-| `warn-threshold-percent` | Warn when size exceeds this % of limit | No | `80` |
+| `warn-size-kb` | Warning threshold in KB | No | `3500` |
 | `working-directory` | Directory to run build commands | No | `.` |
 
 ## Outputs
@@ -21,9 +21,8 @@ NEAR enforces a 4MB contract size limit. Catching oversized contracts in CI prev
 | Output | Description |
 |--------|-------------|
 | `wasm-size-kb` | Compiled contract size in KB |
-| `size-percent` | Percentage of the size limit used |
-| `status` | Result: `ok`, `warning`, or `failed` |
-| `optimization-tips` | Suggested steps to reduce binary size |
+| `size-status` | `ok`, `warning`, or `exceeded` |
+| `size-diff-kb` | Size difference from previous build |
 
 ## Usage
 
@@ -42,18 +41,19 @@ jobs:
         with:
           contract-path: ./contracts/my-contract
           max-size-kb: 4096
-          warn-threshold-percent: 80
+          warn-size-kb: 3500
 
-      - name: Print Size Result
-        run: |
-          echo "Size: ${{ steps.size-check.outputs.wasm-size-kb }} KB"
-          echo "Status: ${{ steps.size-check.outputs.status }}"
+## Behavior
+
+- **OK** — Size is below the warning threshold
+- **Warning** — Size is between `warn-size-kb` and `max-size-kb`; workflow continues
+- **Exceeded** — Size is above `max-size-kb`; workflow fails
 
 ## Optimization Tips
 
-When the action detects an oversized contract it suggests:
+When size is large, the action suggests:
 
 - Enable `opt-level = "z"` in `Cargo.toml`
 - Remove unused dependencies
-- Enable `lto = true` and `codegen-units = 1`
-- Strip debug symbols with `wasm-opt`
+- Run `wasm-opt` post-build
+- Strip debug symbols

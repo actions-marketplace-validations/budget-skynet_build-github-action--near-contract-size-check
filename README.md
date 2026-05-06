@@ -1,28 +1,27 @@
 # NEAR Contract Size Check
 
-Builds your NEAR smart contract and checks the WASM binary size against protocol limits. Fails the workflow if the contract exceeds the maximum allowed size and warns when approaching the threshold.
+Builds your NEAR smart contract and checks the WASM binary size against protocol limits. Fails the workflow if the contract exceeds the maximum size and warns when approaching the threshold.
 
 ## Why It Matters
 
-NEAR enforces a 4MB contract size limit. Discovering oversized contracts at deployment time wastes time and blocks releases. This action catches size issues early in CI.
+NEAR enforces a 4MB contract size limit. Catching oversized contracts in CI prevents failed deployments and surfaces optimization opportunities early.
 
 ## Inputs
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `contract-path` | Path to the contract directory | Yes | `.` |
-| `wasm-path` | Path to compiled WASM file | No | Auto-detected |
-| `max-size-kb` | Maximum allowed size in KB | No | `4096` |
-| `warn-size-kb` | Warning threshold in KB | No | `3500` |
-| `working-directory` | Directory to run build commands | No | `.` |
+| `contract-path` | Path to the contract directory | No | `.` |
+| `warn-threshold-kb` | Warn when size exceeds this value (KB) | No | `3500` |
+| `max-size-kb` | Fail when size exceeds this value (KB) | No | `4096` |
+| `baseline-branch` | Branch to compare size against | No | `main` |
 
 ## Outputs
 
 | Output | Description |
 |--------|-------------|
-| `wasm-size-kb` | Compiled contract size in KB |
-| `size-status` | `ok`, `warning`, or `exceeded` |
-| `size-diff-kb` | Size difference from previous build |
+| `wasm-size-kb` | Final WASM size in kilobytes |
+| `size-delta-kb` | Size change compared to baseline branch |
+| `status` | Result: `ok`, `warning`, or `failed` |
 
 ## Usage
 
@@ -36,24 +35,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check NEAR Contract Size
+      - name: Check NEAR contract size
         uses: your-org/near-contract-size-check@v1
         with:
-          contract-path: ./contracts/my-contract
+          contract-path: ./contract
+          warn-threshold-kb: 3500
           max-size-kb: 4096
-          warn-size-kb: 3500
+          baseline-branch: main
 
-## Behavior
+## What It Does
 
-- **OK** — Size is below the warning threshold
-- **Warning** — Size is between `warn-size-kb` and `max-size-kb`; workflow continues
-- **Exceeded** — Size is above `max-size-kb`; workflow fails
+1. Installs the Rust WASM toolchain
+2. Builds the contract with `cargo build --target wasm32-unknown-unknown --release`
+3. Measures the output WASM binary size
+4. Compares against the baseline branch if available
+5. Posts a summary with size delta to the workflow log
+6. Exits with an error if the limit is exceeded
 
 ## Optimization Tips
 
-When size is large, the action suggests:
-
-- Enable `opt-level = "z"` in `Cargo.toml`
-- Remove unused dependencies
-- Run `wasm-opt` post-build
-- Strip debug symbols
+When the warning threshold is hit, the action suggests running `wasm-opt` or enabling `lto = true` in your `Cargo.toml` release profile.

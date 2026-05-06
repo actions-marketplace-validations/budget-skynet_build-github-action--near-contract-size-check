@@ -54,3 +54,7 @@ runs:
         INPUT_BASELINE_ARTIFACT: ${{ inputs.baseline_artifact }}
         INPUT_FAIL_ON_EXCEEDED: ${{ inputs.fail_on_exceeded }}
         INPUT_OPTIMIZATION_LEVEL: ${{ inputs.optimization_level }}
+
+branding:
+  icon: 'check-circle'
+  color: 'green'

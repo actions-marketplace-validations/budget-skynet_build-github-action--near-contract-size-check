@@ -3,29 +3,29 @@ description: "## Overview Create a GitHub Action that checks NEAR contract WASM 
 
 inputs:
   contract_path:
-    description: "Path to the NEAR contract directory or WASM file to check"
+    description: "Path to the NEAR contract directory or main.rs file"
     required: true
     default: ''
-  size_limit_kb:
-    description: "Maximum allowed contract size in kilobytes before failing"
+  size_limit_bytes:
+    description: "Maximum allowed contract WASM size in bytes"
     required: false
-    default: '4096'
+    default: '52428800'
   warning_threshold_percent:
-    description: "Percentage of size limit at which to issue a warning (e.g., 80 for 80%)"
+    description: "Percentage of size limit to trigger warning (e.g., 80 for 80%)"
     required: false
     default: '80'
-  compare_with_previous:
-    description: "Enable comparison with previous build size from artifacts or git history"
+  compare_with_main:
+    description: "Compare current build size with main branch for regression detection"
     required: false
     default: 'true'
-  optimization_suggestions:
-    description: "Enable automated optimization suggestions for oversized contracts"
-    required: false
-    default: 'true'
-  fail_on_limit_exceeded:
+  fail_on_exceeded:
     description: "Fail the workflow if contract size exceeds the limit"
     required: false
     default: 'true'
+  optimization_level:
+    description: "Rust optimization level for build (release or custom flags)"
+    required: false
+    default: 'release'
 
 outputs:
   result:
@@ -49,8 +49,8 @@ runs:
       run: cd ${{ github.action_path }} && node src/index.js
       env:
         INPUT_CONTRACT_PATH: ${{ inputs.contract_path }}
-        INPUT_SIZE_LIMIT_KB: ${{ inputs.size_limit_kb }}
+        INPUT_SIZE_LIMIT_BYTES: ${{ inputs.size_limit_bytes }}
         INPUT_WARNING_THRESHOLD_PERCENT: ${{ inputs.warning_threshold_percent }}
-        INPUT_COMPARE_WITH_PREVIOUS: ${{ inputs.compare_with_previous }}
-        INPUT_OPTIMIZATION_SUGGESTIONS: ${{ inputs.optimization_suggestions }}
-        INPUT_FAIL_ON_LIMIT_EXCEEDED: ${{ inputs.fail_on_limit_exceeded }}
+        INPUT_COMPARE_WITH_MAIN: ${{ inputs.compare_with_main }}
+        INPUT_FAIL_ON_EXCEEDED: ${{ inputs.fail_on_exceeded }}
+        INPUT_OPTIMIZATION_LEVEL: ${{ inputs.optimization_level }}
